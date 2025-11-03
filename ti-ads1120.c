@@ -136,7 +136,6 @@ struct ads1120_state {
 	struct mutex		lock;
 
 	u8 config[4];
-	int current_channel;
 
 	/* DMA-safe buffer for SPI transfers. */
 	u8 data[4] __aligned(IIO_DMA_MINALIGN);
@@ -345,20 +344,12 @@ static int ads1120_read_measurement(struct ads1120_state *st, int channel,
 	if (ret)
 		return ret;
 
-	/*
-	 * Wait for conversion to complete.
-	 * Note: Data rate affects conversion time and filtering even in
-	 * single-shot mode. Future enhancement: use DRDY interrupt for
-	 * more efficient buffered reads.
-	 */
+	/* Wait for conversion to complete. */
 	msleep(ads1120_get_conv_time_ms(st));
 
-	/* Read the result */
 	ret = ads1120_read_raw_adc(st, val);
 	if (ret)
 		return ret;
-
-	st->current_channel = channel;
 
 	return 0;
 }
@@ -454,21 +445,13 @@ static const struct iio_info ads1120_info = {
 
 static int ads1120_init(struct ads1120_state *st)
 {
-	int ret;
+	int ret, config2, config3;
 
 	ret = ads1120_reset(st);
 	if (ret)
 		return dev_err_probe(&st->spi->dev, ret,
 				     "Failed to reset device\n");
 
-	/*
-	 * Configure Register 0:
-	 * - Input MUX: AIN0/AVSS (updated per channel read)
-	 * - Gain: 1 (updated when scale is written)
-	 * - PGA bypassed for lower power consumption.
-	 *   Note: When gain > 4, the PGA is automatically enabled
-	 *   regardless of this bit, so it's safe to always set.
-	 */
 	st->config[0] = FIELD_PREP(ADS1120_CFG0_MUX_MASK,
 				   ADS1120_CFG0_MUX_AIN0_AVSS) |
 			FIELD_PREP(ADS1120_CFG0_GAIN_MASK,
@@ -478,61 +461,38 @@ static int ads1120_init(struct ads1120_state *st)
 	if (ret)
 		return ret;
 
-	/*
-	 * Configure Register 1:
-	 * - Data rate: 175 SPS (good balance of speed and noise)
-	 * - Mode: Normal (vs duty-cycle or turbo)
-	 * - Conversion mode: Single-shot
-	 * - Temperature sensor: Disabled
-	 * - Burnout current: Disabled
-	 */
 	st->config[1] = FIELD_PREP(ADS1120_CFG1_DR_MASK,
 				   ADS1120_CFG1_DR_175SPS) |
 			FIELD_PREP(ADS1120_CFG1_MODE_MASK,
 				   ADS1120_CFG1_MODE_NORMAL) |
 			FIELD_PREP(ADS1120_CFG1_CM_MASK,
-				   ADS1120_CFG1_CM_SINGLE);
+				   ADS1120_CFG1_CM_SINGLE) |
+			FIELD_PREP(ADS1120_CFG1_TS_EN, 0) |
+			FIELD_PREP(ADS1120_CFG1_BCS_EN, 0);
 	ret = ads1120_write_reg(st, ADS1120_REG_CONFIG1, st->config[1]);
 	if (ret)
 		return ret;
 
-	/*
-	 * Configure Register 2:
-	 * - Voltage reference: AVDD (supply voltage)
-	 * - 50/60Hz rejection: Off (no simultaneous rejection)
-	 * - Power switch: Off (not used)
-	 * - IDAC: Off (excitation current not needed)
-	 */
-	st->config[2] = FIELD_PREP(ADS1120_CFG2_VREF_MASK,
-				   ADS1120_CFG2_VREF_AVDD) |
-			FIELD_PREP(ADS1120_CFG2_REJECT_MASK,
-				   ADS1120_CFG2_REJECT_OFF) |
-			FIELD_PREP(ADS1120_CFG2_IDAC_MASK,
-				   ADS1120_CFG2_IDAC_OFF);
-	ret = ads1120_write_reg(st, ADS1120_REG_CONFIG2, st->config[2]);
+	config2 = FIELD_PREP(ADS1120_CFG2_VREF_MASK,
+		   	     ADS1120_CFG2_VREF_AVDD) |
+		  FIELD_PREP(ADS1120_CFG2_REJECT_MASK,
+		             ADS1120_CFG2_REJECT_OFF) |
+		  FIELD_PREP(ADS1120_CFG2_PSW_EN, 0) |
+		  FIELD_PREP(ADS1120_CFG2_IDAC_MASK,
+		             ADS1120_CFG2_IDAC_OFF);
+	ret = ads1120_write_reg(st, ADS1120_REG_CONFIG2, config2);
 	if (ret)
 		return ret;
 
-	/*
-	 * Configure Register 3:
-	 * - IDAC1: Disabled
-	 * - IDAC2: Disabled
-	 * - DRDY mode: Keep default (DRDY only on DRDY pin)
-	 *   Don't enable DOUT/DRDY multiplexing since we don't use
-	 *   the DRDY interrupt in this driver.
-	 */
-	st->config[3] = FIELD_PREP(ADS1120_CFG3_IDAC1_MASK,
-				   ADS1120_CFG3_IDAC1_DISABLED) |
-			FIELD_PREP(ADS1120_CFG3_IDAC2_MASK,
-				   ADS1120_CFG3_IDAC2_DISABLED) |
-			FIELD_PREP(ADS1120_CFG3_DRDYM_MASK,
-				   ADS1120_CFG3_DRDYM_DRDY_ONLY);
-	ret = ads1120_write_reg(st, ADS1120_REG_CONFIG3, st->config[3]);
+	config3 = FIELD_PREP(ADS1120_CFG3_IDAC1_MASK,
+			     ADS1120_CFG3_IDAC1_DISABLED) |
+		  FIELD_PREP(ADS1120_CFG3_IDAC2_MASK,
+			     ADS1120_CFG3_IDAC2_DISABLED) |
+		  FIELD_PREP(ADS1120_CFG3_DRDYM_MASK,
+			     ADS1120_CFG3_DRDYM_DRDY_ONLY);
+	ret = ads1120_write_reg(st, ADS1120_REG_CONFIG3, config3);
 	if (ret)
 		return ret;
-
-	/* Initialize state variables */
-	st->current_channel = -1;
 
 	return 0;
 }
