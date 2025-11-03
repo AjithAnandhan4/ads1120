@@ -137,15 +137,8 @@ struct ads1120_state {
 
 	u8 config[4];
 	int current_channel;
-	int gain;
-	int datarate;
-	int conv_time_ms;
 
-	/*
-	 * DMA-safe buffer for SPI transfers. Must be at the end of the
-	 * structure to ensure no other fields share the same cache line,
-	 * as they might be accessed in parallel during SPI transfers.
-	 */
+	/* DMA-safe buffer for SPI transfers. */
 	u8 data[4] __aligned(IIO_DMA_MINALIGN);
 };
 
@@ -186,6 +179,20 @@ static const struct iio_chan_spec ads1120_channels[] = {
 	ADS1120_CHANNEL(2),
 	ADS1120_CHANNEL(3),
 };
+
+static int ads1120_get_conv_time_ms(struct ads1120_state *st)
+{
+	u8 dr_bits = FIELD_GET(ADS1120_CFG1_DR_MASK, st->config[1]);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(ads1120_datarates); i++) {
+		if (ads1120_datarates[i].reg_value == dr_bits)
+			return ads1120_datarates[i].conv_time_ms;
+	}
+
+	/* Should never happen with valid config */
+	return 7;  /* Default to 175 SPS timing */
+}
 
 static int ads1120_write_cmd(struct ads1120_state *st, u8 cmd)
 {
@@ -249,11 +256,9 @@ static int ads1120_set_channel(struct ads1120_state *st, int channel)
 	/* Map channel to AINx/AVSS single-ended input */
 	mux_val = ADS1120_CFG0_MUX_AIN0_AVSS + channel;
 
-	config0 = st->config[0];
-	config0 &= ~ADS1120_CFG0_MUX_MASK;
-	config0 |= FIELD_PREP(ADS1120_CFG0_MUX_MASK, mux_val);
+	config0 = FIELD_MODIFY(st->config[0], ADS1120_CFG0_MUX_MASK, mux_val);
 	st->config[0] = config0;
-
+	
 	return ads1120_write_reg(st, ADS1120_REG_CONFIG0, config0);
 }
 
@@ -271,12 +276,9 @@ static int ads1120_set_gain(struct ads1120_state *st, int gain_val)
 	if (i == ARRAY_SIZE(ads1120_gain_values))
 		return -EINVAL;
 
-	config0 = st->config[0];
-	config0 &= ~ADS1120_CFG0_GAIN_MASK;
-	config0 |= FIELD_PREP(ADS1120_CFG0_GAIN_MASK, i);
+	config0 = FIELD_MODIFY(st->config[0], ADS1120_CFG0_GAIN_MASK, i);
 	st->config[0] = config0;
-	st->gain = gain_val;
-
+	
 	return ads1120_write_reg(st, ADS1120_REG_CONFIG0, config0);
 }
 
@@ -289,14 +291,10 @@ static int ads1120_set_datarate(struct ads1120_state *st, int rate)
 	for (i = 0; i < ARRAY_SIZE(ads1120_datarates); i++) {
 		if (ads1120_datarates[i].rate != rate)
 			continue;
-
-		config1 = st->config[1];
-		config1 &= ~ADS1120_CFG1_DR_MASK;
-		config1 |= FIELD_PREP(ADS1120_CFG1_DR_MASK,
-				      ads1120_datarates[i].reg_value);
+		
+		config1 = FIELD_MODIFY(st->config[1], ADS1120_CFG1_DR_MASK,
+				       ads1120_datarates[i].reg_value);
 		st->config[1] = config1;
-		st->datarate = rate;
-		st->conv_time_ms = ads1120_datarates[i].conv_time_ms;
 
 		return ads1120_write_reg(st, ADS1120_REG_CONFIG1, config1);
 	}
@@ -353,7 +351,7 @@ static int ads1120_read_measurement(struct ads1120_state *st, int channel,
 	 * single-shot mode. Future enhancement: use DRDY interrupt for
 	 * more efficient buffered reads.
 	 */
-	msleep(st->conv_time_ms);
+	msleep(ads1120_get_conv_time_ms(st));
 
 	/* Read the result */
 	ret = ads1120_read_raw_adc(st, val);
@@ -371,6 +369,9 @@ static int ads1120_read_raw(struct iio_dev *indio_dev,
 {
 	struct ads1120_state *st = iio_priv(indio_dev);
 	int ret;
+	int gain_index;
+	u8 dr_bits;
+	int i;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
@@ -381,12 +382,21 @@ static int ads1120_read_raw(struct iio_dev *indio_dev,
 		return IIO_VAL_INT;
 
 	case IIO_CHAN_INFO_SCALE:
-		*val = st->gain;
+		/* Look up gain value from config register */
+		gain_index = FIELD_GET(ADS1120_CFG0_GAIN_MASK, st->config[0]);
+		*val = ads1120_gain_values[gain_index];
 		return IIO_VAL_INT;
 
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		*val = st->datarate;
-		return IIO_VAL_INT;
+		/* Look up data rate from config register */
+		dr_bits = FIELD_GET(ADS1120_CFG1_DR_MASK, st->config[1]);
+		for (i = 0; i < ARRAY_SIZE(ads1120_datarates); i++) {
+			if (ads1120_datarates[i].reg_value == dr_bits) {
+				*val = ads1120_datarates[i].rate;
+				return IIO_VAL_INT;
+			}
+		}
+		return -EINVAL;
 
 	default:
 		return -EINVAL;
@@ -521,10 +531,7 @@ static int ads1120_init(struct ads1120_state *st)
 	if (ret)
 		return ret;
 
-	/* Initialize state variables from config */
-	st->gain = 1;  /* Matches GAIN_1 setting above */
-	st->datarate = 175;  /* Matches DR_175SPS above */
-	st->conv_time_ms = 7;  /* Conversion time for 175 SPS */
+	/* Initialize state variables */
 	st->current_channel = -1;
 
 	return 0;
