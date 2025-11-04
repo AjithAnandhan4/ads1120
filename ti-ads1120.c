@@ -40,10 +40,24 @@
 
 /* Config Register 0 bit definitions */
 #define ADS1120_CFG0_MUX_MASK		GENMASK(7, 4)
+/* Differential inputs */
+#define ADS1120_CFG0_MUX_AIN0_AIN1	0
+#define ADS1120_CFG0_MUX_AIN0_AIN2	1
+#define ADS1120_CFG0_MUX_AIN0_AIN3	2
+#define ADS1120_CFG0_MUX_AIN1_AIN2	3
+#define ADS1120_CFG0_MUX_AIN1_AIN3	4
+#define ADS1120_CFG0_MUX_AIN2_AIN3	5
+#define ADS1120_CFG0_MUX_AIN1_AIN0	6
+#define ADS1120_CFG0_MUX_AIN3_AIN2	7
+/* Single-ended inputs */
 #define ADS1120_CFG0_MUX_AIN0_AVSS	8
 #define ADS1120_CFG0_MUX_AIN1_AVSS	9
 #define ADS1120_CFG0_MUX_AIN2_AVSS	10
 #define ADS1120_CFG0_MUX_AIN3_AVSS	11
+/* Diagnostic inputs */
+#define ADS1120_CFG0_MUX_REFP_REFN_4	12
+#define ADS1120_CFG0_MUX_AVDD_AVSS_4	13
+#define ADS1120_CFG0_MUX_SHORTED	14
 
 #define ADS1120_CFG0_GAIN_MASK		GENMASK(3, 1)
 #define ADS1120_CFG0_GAIN_1		0
@@ -148,21 +162,64 @@ struct ads1120_state {
 
 static const int ads1120_gain_values[] = { 1, 2, 4, 8, 16, 32, 64, 128 };
 
-#define ADS1120_CHANNEL(index)					\
+/* Differential channel macro */
+#define ADS1120_DIFF_CHANNEL(index, chan1, chan2)		\
+{								\
+	.type = IIO_VOLTAGE,					\
+	.indexed = 1,						\
+	.channel = chan1,					\
+	.channel2 = chan2,					\
+	.differential = 1,					\
+	.address = index,					\
+	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |		\
+			      BIT(IIO_CHAN_INFO_SCALE),		\
+	.info_mask_separate_available = BIT(IIO_CHAN_INFO_SCALE), \
+}
+
+/* Single-ended channel macro */
+#define ADS1120_SINGLE_CHANNEL(index, chan)			\
+{								\
+	.type = IIO_VOLTAGE,					\
+	.indexed = 1,						\
+	.channel = chan,					\
+	.address = index,					\
+	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |		\
+			      BIT(IIO_CHAN_INFO_SCALE),		\
+	.info_mask_separate_available = BIT(IIO_CHAN_INFO_SCALE), \
+}
+
+/* Diagnostic channel macro */
+#define ADS1120_DIAG_CHANNEL(index, label)			\
 {								\
 	.type = IIO_VOLTAGE,					\
 	.indexed = 1,						\
 	.channel = index,					\
+	.address = index,					\
+	.extend_name = label,					\
 	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |		\
 			      BIT(IIO_CHAN_INFO_SCALE),		\
 	.info_mask_separate_available = BIT(IIO_CHAN_INFO_SCALE), \
 }
 
 static const struct iio_chan_spec ads1120_channels[] = {
-	ADS1120_CHANNEL(0),
-	ADS1120_CHANNEL(1),
-	ADS1120_CHANNEL(2),
-	ADS1120_CHANNEL(3),
+	/* Differential inputs */
+	ADS1120_DIFF_CHANNEL(ADS1120_CFG0_MUX_AIN0_AIN1, 0, 1),
+	ADS1120_DIFF_CHANNEL(ADS1120_CFG0_MUX_AIN0_AIN2, 0, 2),
+	ADS1120_DIFF_CHANNEL(ADS1120_CFG0_MUX_AIN0_AIN3, 0, 3),
+	ADS1120_DIFF_CHANNEL(ADS1120_CFG0_MUX_AIN1_AIN2, 1, 2),
+	ADS1120_DIFF_CHANNEL(ADS1120_CFG0_MUX_AIN1_AIN3, 1, 3),
+	ADS1120_DIFF_CHANNEL(ADS1120_CFG0_MUX_AIN2_AIN3, 2, 3),
+	ADS1120_DIFF_CHANNEL(ADS1120_CFG0_MUX_AIN1_AIN0, 1, 0),
+	ADS1120_DIFF_CHANNEL(ADS1120_CFG0_MUX_AIN3_AIN2, 3, 2),
+	/* Single-ended inputs */
+	ADS1120_SINGLE_CHANNEL(ADS1120_CFG0_MUX_AIN0_AVSS, 0),
+	ADS1120_SINGLE_CHANNEL(ADS1120_CFG0_MUX_AIN1_AVSS, 1),
+	ADS1120_SINGLE_CHANNEL(ADS1120_CFG0_MUX_AIN2_AVSS, 2),
+	ADS1120_SINGLE_CHANNEL(ADS1120_CFG0_MUX_AIN3_AVSS, 3),
+	/* Diagnostic inputs */
+	ADS1120_DIAG_CHANNEL(ADS1120_CFG0_MUX_REFP_REFN_4, "ref_div4"),
+	ADS1120_DIAG_CHANNEL(ADS1120_CFG0_MUX_AVDD_AVSS_4, "avdd_div4"),
+	ADS1120_DIAG_CHANNEL(ADS1120_CFG0_MUX_SHORTED, "shorted"),
 };
 
 
@@ -201,19 +258,13 @@ static int ads1120_reset(struct ads1120_state *st)
 	return 0;
 }
 
-static int ads1120_set_channel(struct ads1120_state *st, int channel)
+static int ads1120_set_mux(struct ads1120_state *st, u8 mux_val)
 {
-	u8 mux_val;
-
-	if (channel < 0 || channel > 3)
+	if (mux_val > ADS1120_CFG0_MUX_SHORTED)
 		return -EINVAL;
-
-	/* Map channel to AINx/AVSS single-ended input */
-	mux_val = ADS1120_CFG0_MUX_AIN0_AVSS + channel;
 
 	FIELD_MODIFY(ADS1120_CFG0_MUX_MASK, &st->config[0], mux_val);
 
-	
 	return ads1120_write_reg(st, ADS1120_REG_CONFIG0, st->config[0]);
 }
 
@@ -264,12 +315,15 @@ static int ads1120_read_raw_adc(struct ads1120_state *st, int *val)
 	return 0;
 }
 
-static int ads1120_read_measurement(struct ads1120_state *st, int channel,
-				    int *val)
+static int ads1120_read_measurement(struct ads1120_state *st,
+				    const struct iio_chan_spec *chan, int *val)
 {
 	int ret;
+	u8 mux_val;
 
-	ret = ads1120_set_channel(st, channel);
+	/* Use the channel address which corresponds to the MUX configuration */
+	mux_val = chan->address;
+	ret = ads1120_set_mux(st, mux_val);
 	if (ret)
 		return ret;
 
@@ -299,7 +353,7 @@ static int ads1120_read_raw(struct iio_dev *indio_dev,
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
 		guard(mutex)(&st->lock);
-		ret = ads1120_read_measurement(st, chan->channel, val);
+		ret = ads1120_read_measurement(st, chan, val);
 		if (ret)
 			return ret;
 		return IIO_VAL_INT;
