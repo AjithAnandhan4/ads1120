@@ -19,10 +19,10 @@
 #include <linux/mod_devicetable.h>
 #include <linux/mutex.h>
 #include <linux/spi/spi.h>
+#include <linux/unaligned.h>
 
 #include <linux/iio/iio.h>
 
-#include <asm/unaligned.h>
 
 /* Commands */
 #define ADS1120_CMD_RESET		0x06
@@ -127,6 +127,10 @@
 #define ADS1120_CFG3_DRDYM_DRDY_ONLY	0
 #define ADS1120_CFG3_DRDYM_BOTH		1
 
+/* Conversion time for 20 SPS */
+#define ADS1120_CONV_TIME_MS		51
+
+
 struct ads1120_state {
 	struct spi_device	*spi;
 	/*
@@ -141,24 +145,8 @@ struct ads1120_state {
 	u8 data[4] __aligned(IIO_DMA_MINALIGN);
 };
 
-struct ads1120_datarate {
-	int rate;
-	int conv_time_ms;
-	u8 reg_value;
-};
-
-static const struct ads1120_datarate ads1120_datarates[] = {
-	{ 20,   51, ADS1120_CFG1_DR_20SPS },
-	{ 45,   24, ADS1120_CFG1_DR_45SPS },
-	{ 90,   13, ADS1120_CFG1_DR_90SPS },
-	{ 175,   7, ADS1120_CFG1_DR_175SPS },
-	{ 330,   4, ADS1120_CFG1_DR_330SPS },
-	{ 600,   3, ADS1120_CFG1_DR_600SPS },
-	{ 1000,  2, ADS1120_CFG1_DR_1000SPS },
-};
 
 static const int ads1120_gain_values[] = { 1, 2, 4, 8, 16, 32, 64, 128 };
-static const int ads1120_datarates_list[] = { 20, 45, 90, 175, 330, 600, 1000 };
 
 #define ADS1120_CHANNEL(index)					\
 {								\
@@ -168,8 +156,6 @@ static const int ads1120_datarates_list[] = { 20, 45, 90, 175, 330, 600, 1000 };
 	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |		\
 			      BIT(IIO_CHAN_INFO_SCALE),		\
 	.info_mask_separate_available = BIT(IIO_CHAN_INFO_SCALE), \
-	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ) | \
-				   BIT(IIO_CHAN_INFO_SAMP_FREQ_AVAIL), \
 }
 
 static const struct iio_chan_spec ads1120_channels[] = {
@@ -179,19 +165,6 @@ static const struct iio_chan_spec ads1120_channels[] = {
 	ADS1120_CHANNEL(3),
 };
 
-static int ads1120_get_conv_time_ms(struct ads1120_state *st)
-{
-	u8 dr_bits = FIELD_GET(ADS1120_CFG1_DR_MASK, st->config[1]);
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(ads1120_datarates); i++) {
-		if (ads1120_datarates[i].reg_value == dr_bits)
-			return ads1120_datarates[i].conv_time_ms;
-	}
-
-	/* Should never happen with valid config */
-	return 7;  /* Default to 175 SPS timing */
-}
 
 static int ads1120_write_cmd(struct ads1120_state *st, u8 cmd)
 {
@@ -208,23 +181,6 @@ static int ads1120_write_reg(struct ads1120_state *st, u8 reg, u8 value)
 	st->data[1] = value;
 
 	return spi_write(st->spi, st->data, 2);
-}
-
-static int ads1120_read_reg(struct ads1120_state *st, u8 reg, u8 *value)
-{
-	int ret;
-
-	if (reg > ADS1120_REG_CONFIG3)
-		return -EINVAL;
-
-	st->data[0] = ADS1120_CMD_RREG | (reg << 2);
-
-	ret = spi_write_then_read(st->spi, st->data, 1, st->data, 1);
-	if (ret)
-		return ret;
-
-	*value = st->data[0];
-	return 0;
 }
 
 static int ads1120_reset(struct ads1120_state *st)
@@ -247,7 +203,7 @@ static int ads1120_reset(struct ads1120_state *st)
 
 static int ads1120_set_channel(struct ads1120_state *st, int channel)
 {
-	u8 mux_val, config0;
+	u8 mux_val;
 
 	if (channel < 0 || channel > 3)
 		return -EINVAL;
@@ -255,15 +211,14 @@ static int ads1120_set_channel(struct ads1120_state *st, int channel)
 	/* Map channel to AINx/AVSS single-ended input */
 	mux_val = ADS1120_CFG0_MUX_AIN0_AVSS + channel;
 
-	config0 = FIELD_MODIFY(st->config[0], ADS1120_CFG0_MUX_MASK, mux_val);
-	st->config[0] = config0;
+	FIELD_MODIFY(ADS1120_CFG0_MUX_MASK, &st->config[0], mux_val);
+
 	
-	return ads1120_write_reg(st, ADS1120_REG_CONFIG0, config0);
+	return ads1120_write_reg(st, ADS1120_REG_CONFIG0, st->config[0]);
 }
 
 static int ads1120_set_gain(struct ads1120_state *st, int gain_val)
 {
-	u8 config0;
 	int i;
 
 	/* Find gain in supported values */
@@ -275,30 +230,9 @@ static int ads1120_set_gain(struct ads1120_state *st, int gain_val)
 	if (i == ARRAY_SIZE(ads1120_gain_values))
 		return -EINVAL;
 
-	config0 = FIELD_MODIFY(st->config[0], ADS1120_CFG0_GAIN_MASK, i);
-	st->config[0] = config0;
+	FIELD_MODIFY(ADS1120_CFG0_GAIN_MASK, &st->config[0], i);
 	
-	return ads1120_write_reg(st, ADS1120_REG_CONFIG0, config0);
-}
-
-static int ads1120_set_datarate(struct ads1120_state *st, int rate)
-{
-	u8 config1;
-	int i;
-
-	/* Find data rate in supported values */
-	for (i = 0; i < ARRAY_SIZE(ads1120_datarates); i++) {
-		if (ads1120_datarates[i].rate != rate)
-			continue;
-		
-		config1 = FIELD_MODIFY(st->config[1], ADS1120_CFG1_DR_MASK,
-				       ads1120_datarates[i].reg_value);
-		st->config[1] = config1;
-
-		return ads1120_write_reg(st, ADS1120_REG_CONFIG1, config1);
-	}
-
-	return -EINVAL;
+	return ads1120_write_reg(st, ADS1120_REG_CONFIG0, st->config[0]);
 }
 
 static int ads1120_read_raw_adc(struct ads1120_state *st, int *val)
@@ -345,7 +279,7 @@ static int ads1120_read_measurement(struct ads1120_state *st, int channel,
 		return ret;
 
 	/* Wait for conversion to complete. */
-	msleep(ads1120_get_conv_time_ms(st));
+	msleep(ADS1120_CONV_TIME_MS);
 
 	ret = ads1120_read_raw_adc(st, val);
 	if (ret)
@@ -361,8 +295,6 @@ static int ads1120_read_raw(struct iio_dev *indio_dev,
 	struct ads1120_state *st = iio_priv(indio_dev);
 	int ret;
 	int gain_index;
-	u8 dr_bits;
-	int i;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
@@ -377,17 +309,6 @@ static int ads1120_read_raw(struct iio_dev *indio_dev,
 		gain_index = FIELD_GET(ADS1120_CFG0_GAIN_MASK, st->config[0]);
 		*val = ads1120_gain_values[gain_index];
 		return IIO_VAL_INT;
-
-	case IIO_CHAN_INFO_SAMP_FREQ:
-		/* Look up data rate from config register */
-		dr_bits = FIELD_GET(ADS1120_CFG1_DR_MASK, st->config[1]);
-		for (i = 0; i < ARRAY_SIZE(ads1120_datarates); i++) {
-			if (ads1120_datarates[i].reg_value == dr_bits) {
-				*val = ads1120_datarates[i].rate;
-				return IIO_VAL_INT;
-			}
-		}
-		return -EINVAL;
 
 	default:
 		return -EINVAL;
@@ -404,10 +325,6 @@ static int ads1120_write_raw(struct iio_dev *indio_dev,
 	case IIO_CHAN_INFO_SCALE:
 		guard(mutex)(&st->lock);
 		return ads1120_set_gain(st, val);
-
-	case IIO_CHAN_INFO_SAMP_FREQ:
-		guard(mutex)(&st->lock);
-		return ads1120_set_datarate(st, val);
 
 	default:
 		return -EINVAL;
@@ -426,12 +343,6 @@ static int ads1120_read_avail(struct iio_dev *indio_dev,
 		*length = ARRAY_SIZE(ads1120_gain_values);
 		return IIO_AVAIL_LIST;
 
-	case IIO_CHAN_INFO_SAMP_FREQ:
-		*vals = ads1120_datarates_list;
-		*type = IIO_VAL_INT;
-		*length = ARRAY_SIZE(ads1120_datarates_list);
-		return IIO_AVAIL_LIST;
-
 	default:
 		return -EINVAL;
 	}
@@ -445,7 +356,8 @@ static const struct iio_info ads1120_info = {
 
 static int ads1120_init(struct ads1120_state *st)
 {
-	int ret, config2, config3;
+	int ret;
+	u8 config2, config3;
 
 	ret = ads1120_reset(st);
 	if (ret)
@@ -462,7 +374,7 @@ static int ads1120_init(struct ads1120_state *st)
 		return ret;
 
 	st->config[1] = FIELD_PREP(ADS1120_CFG1_DR_MASK,
-				   ADS1120_CFG1_DR_175SPS) |
+				   ADS1120_CFG1_DR_20SPS) |
 			FIELD_PREP(ADS1120_CFG1_MODE_MASK,
 				   ADS1120_CFG1_MODE_NORMAL) |
 			FIELD_PREP(ADS1120_CFG1_CM_MASK,
