@@ -144,6 +144,9 @@
 /* Conversion time for 20 SPS */
 #define ADS1120_CONV_TIME_MS		51
 
+/* Internal reference voltage in millivolts */
+#define ADS1120_VREF_INTERNAL_MV	2048
+
 
 struct ads1120_state {
 	struct spi_device	*spi;
@@ -153,7 +156,8 @@ struct ads1120_state {
 	 */
 	struct mutex		lock;
 
-	u8 config[4];
+	u8 config[2];
+	int vref_mv;
 
 	/* DMA-safe buffer for SPI transfers. */
 	u8 data[4] __aligned(IIO_DMA_MINALIGN);
@@ -282,8 +286,16 @@ static int ads1120_set_gain(struct ads1120_state *st, int gain_val)
 		return -EINVAL;
 
 	FIELD_MODIFY(ADS1120_CFG0_GAIN_MASK, &st->config[0], i);
-	
+
 	return ads1120_write_reg(st, ADS1120_REG_CONFIG0, st->config[0]);
+}
+
+static int ads1120_get_gain(struct ads1120_state *st)
+{
+	int gain_index;
+
+	gain_index = FIELD_GET(ADS1120_CFG0_GAIN_MASK, st->config[0]);
+	return ads1120_gain_values[gain_index];
 }
 
 static int ads1120_read_raw_adc(struct ads1120_state *st, int *val)
@@ -321,7 +333,7 @@ static int ads1120_read_measurement(struct ads1120_state *st,
 	int ret;
 	u8 mux_val;
 
-	/* Use the channel address which corresponds to the MUX configuration */
+	/* Use channel address which corresponds to the MUX configuration */
 	mux_val = chan->address;
 	ret = ads1120_set_mux(st, mux_val);
 	if (ret)
@@ -347,8 +359,7 @@ static int ads1120_read_raw(struct iio_dev *indio_dev,
 			    int *val, int *val2, long mask)
 {
 	struct ads1120_state *st = iio_priv(indio_dev);
-	int ret;
-	int gain_index;
+	int ret, gain;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
@@ -359,10 +370,15 @@ static int ads1120_read_raw(struct iio_dev *indio_dev,
 		return IIO_VAL_INT;
 
 	case IIO_CHAN_INFO_SCALE:
-		/* Look up gain value from config register */
-		gain_index = FIELD_GET(ADS1120_CFG0_GAIN_MASK, st->config[0]);
-		*val = ads1120_gain_values[gain_index];
-		return IIO_VAL_INT;
+		/*
+		 * Scale is calculated as: Vref / (gain * 2^15)
+		 * Reported in mV to provide better precision.
+		 */
+		gain = ads1120_get_gain(st);
+		*val = st->vref_mv;
+		/* 2^15 = 32768, expressed as 15 for shift */
+		*val2 = gain * 15;
+		return IIO_VAL_FRACTIONAL_LOG2;
 
 	default:
 		return -EINVAL;
@@ -418,6 +434,14 @@ static int ads1120_init(struct ads1120_state *st)
 		return dev_err_probe(&st->spi->dev, ret,
 				     "Failed to reset device\n");
 
+	/*
+	 * Configure Register 0:
+	 * - Input MUX: AIN0/AVSS (will be set per channel read)
+	 * - Gain: 1
+	 * - PGA bypass enabled (lower power). When gain is set > 4,
+	 *   this bit is automatically ignored by the hardware and
+	 *   PGA is enabled, so it's safe to leave it set.
+	 */
 	st->config[0] = FIELD_PREP(ADS1120_CFG0_MUX_MASK,
 				   ADS1120_CFG0_MUX_AIN0_AVSS) |
 			FIELD_PREP(ADS1120_CFG0_GAIN_MASK,
@@ -427,6 +451,14 @@ static int ads1120_init(struct ads1120_state *st)
 	if (ret)
 		return ret;
 
+	/*
+	 * Configure Register 1:
+	 * - Data rate: 20 SPS (for single-shot mode)
+	 * - Operating mode: Normal
+	 * - Conversion mode: Single-shot
+	 * - Temperature sensor: Disabled
+	 * - Burnout current: Disabled
+	 */
 	st->config[1] = FIELD_PREP(ADS1120_CFG1_DR_MASK,
 				   ADS1120_CFG1_DR_20SPS) |
 			FIELD_PREP(ADS1120_CFG1_MODE_MASK,
@@ -439,17 +471,30 @@ static int ads1120_init(struct ads1120_state *st)
 	if (ret)
 		return ret;
 
+	/*
+	 * Configure Register 2:
+	 * - Voltage reference: Internal 2.048V
+	 * - 50/60Hz rejection: Off
+	 * - Power switch: Disabled
+	 * - IDAC current: Off
+	 */
 	config2 = FIELD_PREP(ADS1120_CFG2_VREF_MASK,
-		   	     ADS1120_CFG2_VREF_AVDD) |
+			     ADS1120_CFG2_VREF_INTERNAL) |
 		  FIELD_PREP(ADS1120_CFG2_REJECT_MASK,
-		             ADS1120_CFG2_REJECT_OFF) |
+			     ADS1120_CFG2_REJECT_OFF) |
 		  FIELD_PREP(ADS1120_CFG2_PSW_EN, 0) |
 		  FIELD_PREP(ADS1120_CFG2_IDAC_MASK,
-		             ADS1120_CFG2_IDAC_OFF);
+			     ADS1120_CFG2_IDAC_OFF);
 	ret = ads1120_write_reg(st, ADS1120_REG_CONFIG2, config2);
 	if (ret)
 		return ret;
 
+	/*
+	 * Configure Register 3:
+	 * - IDAC1: Disabled
+	 * - IDAC2: Disabled
+	 * - DRDY mode: Only reflects data ready status
+	 */
 	config3 = FIELD_PREP(ADS1120_CFG3_IDAC1_MASK,
 			     ADS1120_CFG3_IDAC1_DISABLED) |
 		  FIELD_PREP(ADS1120_CFG3_IDAC2_MASK,
@@ -459,6 +504,9 @@ static int ads1120_init(struct ads1120_state *st)
 	ret = ads1120_write_reg(st, ADS1120_REG_CONFIG3, config3);
 	if (ret)
 		return ret;
+
+	/* Set reference voltage to internal 2.048V */
+	st->vref_mv = ADS1120_VREF_INTERNAL_MV;
 
 	return 0;
 }
@@ -489,7 +537,8 @@ static int ads1120_probe(struct spi_device *spi)
 
 	ret = ads1120_init(st);
 	if (ret)
-		return ret;
+		return dev_err_probe(&spi->dev, ret,
+			             "Failed to initialize device\n");
 
 	return devm_iio_device_register(dev, indio_dev);
 }
